@@ -17,4 +17,6 @@ echo "#cipherscan"
 ./cipherscan $1
 echo "#tlsprobe"
 python2.7 tlsReport.py $1
+echo "#portScan"
+./nmap-scan.sh $1
 echo "##END DOMAIN TESTS $1"
