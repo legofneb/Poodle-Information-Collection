@@ -1,0 +1,4 @@
+# Nmap 6.47 scan initiated Wed Oct 29 15:23:47 2014 as: ./nmap -p443 --open -oG test google.com
+Host: 74.125.196.100 (yk-in-f100.1e100.net)	Status: Up
+Host: 74.125.196.100 (yk-in-f100.1e100.net)	Ports: 443/open/tcp//https///
+# Nmap done at Wed Oct 29 15:23:47 2014 -- 1 IP address (1 host up) scanned in 0.04 seconds

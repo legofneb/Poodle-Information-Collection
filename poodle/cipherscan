@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+# Author: Julien Vehent [:ulfr] - 2013
+#
+# Modified by Olivier Paroz in September 2014
+#
+# On FreeBSD, you will need the following ports: textproc/gnugrep and sysutils/coreutils
+#
+
+OS=`uname`
+DOBENCHMARK=0
+BENCHMARKITER=30
+TIMEOUTBIN=timeout
+if [ "${OS}" = "FreeBSD" ]; then
+    TIMEOUTBIN=gtimeout
+fi
+OPENSSLBIN="$(dirname $0)/openssl"
+if [ -z "$CACERTS" ]; then
+  for f in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt /usr/local/share/certs/ca-root-nss.crt; do
+    if [ -e "$f" ]; then
+      CACERTS="$f"
+      break
+    fi
+  done
+fi
+if [ ! -e "$CACERTS" ]; then
+    CACERTS="/etc/ssl/certs/ca-certificates.crt"
+fi
+if [ ! -e "$CACERTS" ]; then
+    echo "Warning: CA Certificates not found at $CACERTS, export CACERTS variable with location of your trust anchors" 1>&2
+fi
+CIPHERSUITE="ALL:COMPLEMENTOFALL:+aRSA"
+DEBUG=0
+VERBOSE=0
+DELAY=0
+ALLCIPHERS=0
+OUTPUTFORMAT="terminal"
+TIMEOUT=10
+SNISCAN=0
+
+
+usage() {
+    echo -e "usage: $0 [-a|--allciphers] [-b|--benchmark] [-d|--delay seconds] [-D|--debug] [-j|--json] [-v|--verbose] [-o|--openssl file] [openssl s_client args] <target:port>
+usage: $0 -h|--help
+
+$0 attempts to connect to a target site using all the ciphersuites it knows.
+
+Original script by Julien Vehent. [:ulfr] - https://github.com/jvehent/cipherscan
+FreeBSD version by Olivier Paroz - https://github.com/oparoz/cipherscan
+
+On FreeBSD, you will need the following ports on FreeBSD: textproc/gnugrep and sysutils/coreutils
+
+Port defaults to 443
+
+example: $ $0 www.google.com:443
+
+Use one of the options below:
+
+-a | --allciphers   Test all known ciphers individually at the end.
+-b | --benchmark    Activate benchmark mode.
+-d | --delay        Pause for n seconds between connections
+-D | --debug        Output ALL the information.
+-h | --help         Shows this help text.
+-j | --json         Output results in JSON format.
+-o | --openssl      path/to/your/openssl binary you want to use.
+-s | --sni          Activates SNI
+-v | --verbose      Increase verbosity.
+
+The rest of the arguments will be interpreted as openssl s_client argument.
+This enables checking smtp/imap/pop3/ftp/xmpp via -starttls
+
+EXAMPLES: $0 -starttls xmpp jabber.ccc.de:5222
+"
+}
+
+
+verbose() {
+    if [ $VERBOSE != 0 ]; then
+        echo "$@" >&2
+    fi
+}
+
+debug(){
+    if [ $DEBUG == 1 ]; then
+        echo Debug: "$@" >&2
+	set -evx
+    fi
+}
+
+# Connect to a target host with the selected ciphersuite
+test_cipher_on_target() {
+    local sslcommand=$@
+    cipher=""
+    protocols=""
+    pfs=""
+    previous_cipher=""
+    for tls_version in "-ssl2" "-ssl3" "-tls1" "-tls1_1" "-tls1_2"
+    do
+        debug echo \"Q\" \| $sslcommand $tls_version
+        local tmp=$(echo "Q" | $sslcommand $tls_version 1>/dev/stdout 2>/dev/null)
+        if grep 'OCSP Response Data' <<<"$tmp" >/dev/null; then
+            current_ocspstaple="True"
+        else
+            current_ocspstaple="False"
+        fi
+        # filter out the OCSP server certificate
+        tmp=$(awk 'BEGIN { pr="yes" } /^======================================/ { if ( pr=="yes" ) pr="no"; else pr="yes" } { if ( pr == "yes" ) print }' <<<"$tmp")
+        current_certcn=$(grep "subject=" <<<"$tmp"| grep -oP "(?<=CN\=)[^ |\/]+")
+        current_subjaltnames=$(${OPENSSLBIN} x509 -noout -text 2>/dev/null <<<"$tmp"|awk '/X509v3 Subject Alternative Name/ {getline;gsub(/ /, "", $0);print}' | tr -d "DNS:")
+        current_cipher=$(grep "New, " <<<"$tmp"|awk '{print $5}')
+        current_pfs=$(grep 'Server Temp Key' <<<"$tmp"|awk '{print $4$5$6$7}')
+        if [ -z $current_pfs ]; then
+            current_pfs="None"
+        fi
+        current_protocol=$(egrep "^\s+Protocol\s+:" <<<"$tmp"|awk '{print $3}')
+        current_pubkey=$(grep 'Server public key is ' <<<"$tmp"|awk '{print $5}')
+        if [ -z $current_pubkey ]; then
+            current_pubkey=0
+        fi
+        current_tickethint=$(grep 'ticket lifetime hint' <<<"$tmp"|awk '{print $6 }')
+        if [ -z $current_tickethint ]; then
+            current_tickethint=None
+        fi
+        current_sigalg=$(${OPENSSLBIN} x509 -noout -text 2>/dev/null <<<"$tmp"|grep Signature\ Algorithm | head -n 1 | awk '{print $3}') || current_sigalg="None"
+        grep 'Verify return code: 0 ' <<<"$tmp" >/dev/null
+        if [ $? -eq 0 ]; then
+            current_trusted="True"
+        else
+            current_trusted="False"
+        fi
+        if [ -z $current_sigalg ]; then
+            current_sigalg=None
+        fi
+        if [[ -z "$current_protocol" || "$current_cipher" == '(NONE)' ]]; then
+            # connection failed, try again with next TLS version
+            continue
+        else
+            verbose "connection successful; protocol: $current_protocol, cipher: $current_cipher, previous cipher: $previous_cipher"
+        fi
+        # handling of TLSv1.2 only cipher suites
+        if [ ! -z "$previous_cipher" ] && [ "$previous_cipher" != "$current_cipher" ] && [ "$current_cipher" != "0000" ]; then
+            unset protocols
+        fi
+        previous_cipher=$current_cipher
+
+        # connection succeeded, add TLS version to positive results
+        if [ -z "$protocols" ]; then
+            protocols=$current_protocol
+        else
+            protocols="$protocols,$current_protocol"
+        fi
+        certcns="$current_certcn"
+        # Let's add the alternative subject names if they exist
+        if [ -n "$current_subjaltnames" ]; then
+            IFS=',' read -ra subjaltnamesarray <<<"$current_subjaltnames"
+            for altname in "${subjaltnamesarray[@]}"; do
+                if [[ "$altname" !=  "$current_certcn" ]]; then
+                    certcns="$certcns,$altname"
+            fi
+            done
+        fi
+        cipher=$current_cipher
+        pfs=$current_pfs
+        pubkey=$current_pubkey
+        sigalg=$current_sigalg
+        trusted=$current_trusted
+        tickethint=$current_tickethint
+        ocspstaple=$current_ocspstaple
+        # grab the cipher and PFS key size
+    done
+    # if cipher is empty, that means none of the TLS version worked with
+    # the current cipher
+    if [ -z "$cipher" ]; then
+        verbose "handshake failed, no ciphersuite was returned"
+        result='ConnectionFailure'
+        return 2
+
+    # if cipher contains NONE, the cipher wasn't accepted
+    elif [ "$cipher" == '(NONE)  ' ]; then
+        result="$cipher $protocols $pubkey $sigalg $trusted $tickethint $ocspstaple $pfs $certcns"
+        verbose "handshake failed, server returned ciphersuite '$result'"
+        return 1
+
+    # the connection succeeded
+    else
+        result="$cipher $protocols $pubkey $sigalg $trusted $tickethint $ocspstaple $pfs $certcns"
+        verbose "handshake succeeded, server returned ciphersuite '$result'"
+        return 0
+    fi
+}
+
+
+# Calculate the average handshake time for a specific ciphersuite
+bench_cipher() {
+    local ciphersuite="$1"
+    local sslcommand="$TIMEOUTBIN $TIMEOUT $OPENSSLBIN s_client $SCLIENTARGS -connect $TARGET -cipher $ciphersuite"
+    local t="$(date +%s%N)"
+    verbose "Benchmarking handshake on '$TARGET' with ciphersuite '$ciphersuite'"
+    for i in $(seq 1 $BENCHMARKITER); do
+        debug Connection $i
+        (echo "Q" | $sslcommand 2>/dev/null 1>/dev/null)
+        if [ $? -gt 0 ]; then
+            break
+        fi
+    done
+    # Time interval in nanoseconds
+    local t="$(($(date +%s%N) - t))"
+    verbose "Benchmarking done in $t nanoseconds"
+    # Microseconds
+    cipherbenchms="$((t/1000/$BENCHMARKITER))"
+}
+
+
+# Connect to the target and retrieve the chosen cipher
+# recursively until the connection fails
+get_cipher_pref() {
+    [ "$OUTPUTFORMAT" == "terminal" ] && [ $DEBUG -lt 1 ] && echo -n '.'
+    local ciphersuite="$1"
+    if [ -e $CACERTS ]; then
+        local sslcommand="$TIMEOUTBIN $TIMEOUT $OPENSSLBIN s_client -CAfile $CACERTS -status $SCLIENTARGS -connect $TARGET -cipher $ciphersuite"
+    else
+        local sslcommand="$TIMEOUTBIN $TIMEOUT $OPENSSLBIN s_client -status $SCLIENTARGS -connect $TARGET -cipher $ciphersuite"
+    fi
+    verbose "Connecting to '$TARGET' with ciphersuite '$ciphersuite'"
+    test_cipher_on_target "$sslcommand"
+    local success=$?
+    # If the connection succeeded with the current cipher, benchmark and store
+    if [ $success -eq 0 ]; then
+        cipherspref=("${cipherspref[@]}" "$result")
+        pciph=$(echo $result|awk '{print $1}')
+        get_cipher_pref "!$pciph:$ciphersuite"
+        return 0
+    fi
+    sleep $DELAY
+}
+
+
+display_results_in_terminal() {
+    # Display the results
+    ctr=1
+    local certcns
+    local pubkey
+    local sigalg
+    local trusted
+    local tickethint
+    local ocspstaple
+    local different=False
+    for cipher in "${cipherspref[@]}"; do
+        pciph=$(echo $cipher|awk '{print $1}')
+        if [ $DOBENCHMARK -eq 1 ]; then
+            bench_cipher "$pciph"
+            r="$ctr $cipher $cipherbenchms"
+        else
+            r="$ctr $cipher"
+        fi
+        if [ $ctr -eq 1 ]; then
+            pubkey=$(awk '{print $3}' <<<$cipher)
+            sigalg=$(awk '{print $4}' <<<$cipher)
+            trusted=$(awk '{print $5}' <<<$cipher)
+            tickethint=$(awk '{print $6}' <<<$cipher)
+            ocspstaple=$(awk '{print $7}' <<<$cipher)
+            certcns=$(awk '{print $9}' <<<$cipher)
+        else
+            if [ "$pubkey" != "$(awk '{print $3}' <<<$cipher)" ]; then
+                different=True
+            fi
+            if [ "$sigalg" != "$(awk '{print $4}' <<<$cipher)" ]; then
+                different=True
+            fi
+            if [ "$trusted" != "$(awk '{print $5}' <<<$cipher)" ]; then
+                different=True
+            fi
+            if [ "$tickethint" != "$(awk '{print $6}' <<<$cipher)" ]; then
+                different=True
+            fi
+        fi
+        results=("${results[@]}" "$r")
+        ctr=$((ctr+1))
+    done
+
+    if [ $DOBENCHMARK -eq 1 ]; then
+        if [ $different == "True" ]; then
+            header="prio ciphersuite protocols pubkey_size signature_algoritm trusted ticket_hint pfs_keysize avg_handshake_microsec"
+        else
+            header="prio ciphersuite protocols pfs_keysize avg_handshake_microsec"
+        fi
+    else
+        if [ $different == "True" ]; then
+            header="prio ciphersuite protocols pubkey_size signature_algorithm trusted ticket_hint pfs_keysize"
+        else
+            header="prio ciphersuite protocols pfs_keysize"
+        fi
+    fi
+    ctr=0
+    for result in "${results[@]}"; do
+        if [ $ctr -eq 0 ]; then
+            echo $header
+            ctr=$((ctr+1))
+        fi
+        if [ $different == "True" ]; then
+            echo $result|grep -v '(NONE)'
+        else
+            # prints priority, ciphersuite, protocols and pfs_keysize
+            echo $result|grep -v '(NONE)'|awk '{print $1 " " $2 " " $3 " " $9}'
+        fi
+    done|column -t
+    echo
+    
+    matchhostname=0
+    hostcertcn="Not a match"
+    if [ -z "$certcns" ]; then
+        hostcertcn="CN not found"
+    else
+        IFS=',' read -ra certcnsarray <<<"$certcns"
+        for certcn in "${certcnsarray[@]}"; do
+            if [[ "$certcn" ==  "$HOST" ]]; then
+                matchhostname=1
+                hostcertcn="$certcn"
+                break
+        fi
+        done
+        
+        
+    fi
+    if [ $different != "True" ]; then
+        if [ "$trusted" == "True" ]; then
+            echo "Certificate: $hostcertcn, trusted, $pubkey bit, $sigalg signature"
+        else
+            echo "Certificate: $hostcertcn, UNTRUSTED, $pubkey bit, $sigalg signature"
+        fi
+        echo "TLS ticket lifetime hint: $tickethint"
+    fi
+    if [[ $ocspstaple == "True" ]]; then
+        echo "OCSP stapling: supported"
+    else
+        echo "OCSP stapling: not supported"
+    fi
+    if [ $matchhostname -eq 0 ]; then
+        echo "WARNING - None of the CNs match the hostname given"
+    fi
+    if [ -n "$certcns" ]; then
+        echo "Here is the list of common names found in the certificate"
+        echo $certcns
+    fi
+}
+
+
+display_results_in_json() {
+    # Display the results in json
+    ctr=0
+    echo -n "{\"target\":\"$TARGET\",\"date\":\"$(date -R)\",\"ciphersuite\": ["
+    for cipher in "${cipherspref[@]}"; do
+        [ $ctr -gt 0 ] && echo -n ','
+        echo -n "{\"cipher\":\"$(echo $cipher|awk '{print $1}')\","
+        echo -n "\"protocols\":[\"$(echo $cipher|awk '{print $2}'|sed 's/,/","/g')\"],"
+        echo -n "\"certcns\":[\"$(echo $cipher|awk '{print $9}'|sed 's/,/","/g')\"],"
+        echo -n "\"pubkey\":[\"$(echo $cipher|awk '{print $3}'|sed 's/,/","/g')\"],"
+        echo -n "\"sigalg\":[\"$(echo $cipher|awk '{print $4}'|sed 's/,/","/g')\"],"
+        echo -n "\"trusted\":\"$(echo $cipher|awk '{print $5}'|sed 's/,/","/g')\","
+        echo -n "\"ticket_hint\":\"$(echo $cipher|awk '{print $6}')\","
+        echo -n "\"ocsp_stapling\":\"$(echo $cipher|awk '{print $7}')\","
+        pfs=$(echo $cipher|awk '{print $8}')
+        [ "$pfs" == "" ] && pfs="None"
+        echo -n "\"pfs\":\"$pfs\"}"
+        ctr=$((ctr+1))
+    done
+    echo ']}'
+}
+
+# UNKNOWNOPTIONS=""
+while :
+do
+    case $1 in
+        -h | --help | -\?)
+            usage
+            exit 0      # This is not an error, User asked help. Don't do "exit 1"
+            ;;
+        -o | --openssl)
+            OPENSSLBIN=$2     # You might want to check if you really got FILE
+            shift 2
+            ;;
+        -s | --sni)
+            SNISCAN=1
+            shift
+            ;;
+        -a | --allciphers)
+            ALLCIPHERS=1
+            shift
+            ;;
+        -v | --verbose)
+            # Each instance of -v adds 1 to verbosity
+            VERBOSE=$((VERBOSE+1))
+            shift
+            ;;
+        -j | -json | --json | --JSON)
+            OUTPUTFORMAT="json"
+            shift
+            ;;
+        -b | --benchmark)
+            DOBENCHMARK=1
+            shift
+            ;;
+        -D | --debug)
+            DEBUG=1
+            shift
+            ;;
+        -d | --delay)
+            DELAY=$2
+            shift 2
+            ;;
+        --) # End of all options
+            shift
+            break
+            ;;
+        # -*)
+        #     UNKNOWNOPTIONS=$((UNKNOWNOPTIONS+$1))
+        #     # echo "WARN: Unknown option (ignored): $1" >&2
+        #     shift
+        #     ;;
+        *)  # no more options we understand.
+            break
+            ;;
+    esac
+done
+
+if [ $VERBOSE != 0 ] ; then
+    [ -n "$CACERTS" ] && echo "Using trust anchors from $CACERTS"
+    echo "Loading $($OPENSSLBIN ciphers -v $CIPHERSUITE 2>/dev/null|grep Kx|wc -l) ciphersuites from $(echo -n $($OPENSSLBIN version 2>/dev/null))"
+         $OPENSSLBIN ciphers ALL 2>/dev/null
+fi
+
+# echo paramters left: $@
+
+TEMPTARGET=$(sed -e 's/^.* //'<<<"${@}")
+HOST=$(sed -e 's/:.*//'<<<"${TEMPTARGET}")
+PORT=$(sed -e 's/.*://'<<<"${TEMPTARGET}")
+
+# Default to https if no port given
+if [ "$HOST" = "$PORT" ]; then
+    PORT=443
+fi
+
+debug "host: $HOST"
+debug "Port: $PORT"
+
+TARGET=$HOST:$PORT
+debug "target: $TARGET"
+
+SNIPARAM=""
+if [ $SNISCAN -gt 0 ]; then 
+    SNIPARAM="-servername ${HOST}"
+fi
+SCLIENTARGS="$SNIPARAM $(sed -e s,${TEMPTARGET},,<<<"${@}")"
+debug "sclientargs: $SCLIENTARGS"
+
+
+cipherspref=();
+results=()
+
+# Call to the recursive loop that retrieves the cipher preferences
+get_cipher_pref $CIPHERSUITE
+
+if [ "$OUTPUTFORMAT" == "json" ]; then
+    display_results_in_json
+else
+    echo
+    display_results_in_terminal
+fi
+
+# If asked, test every single cipher individually
+if [ $ALLCIPHERS -gt 0 ]; then
+    echo; echo "All accepted ciphersuites"
+    for c in $($OPENSSLBIN ciphers -v ALL:COMPLEMENTOFALL 2>/dev/null |awk '{print $1}'|sort|uniq); do
+        r="fail"
+        osslcommand="$TIMEOUTBIN $TIMEOUT $OPENSSLBIN s_client $SCLIENTARGS -connect $TARGET -cipher $c"
+        test_cipher_on_target "$osslcommand"
+        if [ $? -eq 0 ]; then
+            r="pass"
+        fi
+        echo "$c $r"|awk '{printf "%-35s %s\n",$1,$2}'
+        debug "Sleeping for $DELAY."
+        sleep $DELAY
+    done
+fi
